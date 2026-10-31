@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 // Anthropic provider adapts Anthropic streams and tool calls for the runtime.
 import Anthropic from "@anthropic-ai/sdk";
 import { Stream } from "@anthropic-ai/sdk/core/streaming.js";
