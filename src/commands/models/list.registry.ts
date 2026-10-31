@@ -1,112 +1,94 @@
-import type { Api, Model } from "@mariozechner/pi-ai";
-import { discoverAuthStorage, discoverModels } from "../../agents/pi-model-discovery.js";
+/** Registry access for full and configured-only model lists. */
+import { modelKey } from "../../agents/model-ref-shared.js";
+import { shouldSuppressBuiltInModelCore } from "../../agents/model-suppression.js";
+import { loadPreparedAgentModelRegistry as loadAgentModelRegistry } from "../../agents/prepared-model-registry.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { Model } from "../../llm/types.js";
+import { formatErrorWithStack } from "./list.errors.js";
+import type { ConfiguredEntry } from "./list.types.js";
 
-import { resolveOpenClawAgentDir } from "../../agents/agent-paths.js";
-import type { AuthProfileStore } from "../../agents/auth-profiles.js";
-import { listProfilesForProvider } from "../../agents/auth-profiles.js";
-import {
-  getCustomProviderApiKey,
-  resolveAwsSdkEnvVarName,
-  resolveEnvApiKey,
-} from "../../agents/model-auth.js";
-import { ensureOpenClawModelsJson } from "../../agents/models-config.js";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { ModelRow } from "./list.types.js";
-import { modelKey } from "./shared.js";
-
-const isLocalBaseUrl = (baseUrl: string) => {
-  try {
-    const url = new URL(baseUrl);
-    const host = url.hostname.toLowerCase();
-    return (
-      host === "localhost" ||
-      host === "127.0.0.1" ||
-      host === "0.0.0.0" ||
-      host === "::1" ||
-      host.endsWith(".local")
-    );
-  } catch {
-    return false;
-  }
+type ModelListRegistryOptions = {
+  agentId?: string;
+  agentDir?: string;
+  providerFilter?: string;
+  normalizeModels?: boolean;
+  workspaceDir?: string;
 };
 
-const hasAuthForProvider = (provider: string, cfg: OpenClawConfig, authStore: AuthProfileStore) => {
-  if (listProfilesForProvider(authStore, provider).length > 0) {
-    return true;
+function validateAvailableModels(availableModels: unknown): Model[] {
+  if (!Array.isArray(availableModels)) {
+    throw new Error("Model availability unavailable: getAvailable() returned a non-array value.");
   }
-  if (provider === "amazon-bedrock" && resolveAwsSdkEnvVarName()) {
-    return true;
-  }
-  if (resolveEnvApiKey(provider)) {
-    return true;
-  }
-  if (getCustomProviderApiKey(cfg, provider)) {
-    return true;
-  }
-  return false;
-};
 
-export async function loadModelRegistry(cfg: OpenClawConfig) {
-  await ensureOpenClawModelsJson(cfg);
-  const agentDir = resolveOpenClawAgentDir();
-  const authStorage = discoverAuthStorage(agentDir);
-  const registry = discoverModels(authStorage, agentDir);
-  const models = registry.getAll();
-  const availableModels = registry.getAvailable();
-  const availableKeys = new Set(availableModels.map((model) => modelKey(model.provider, model.id)));
-  return { registry, models, availableKeys };
+  for (const model of availableModels) {
+    if (
+      !model ||
+      typeof model !== "object" ||
+      typeof (model as { provider?: unknown }).provider !== "string" ||
+      typeof (model as { id?: unknown }).id !== "string"
+    ) {
+      throw new Error(
+        "Model availability unavailable: getAvailable() returned invalid model entries.",
+      );
+    }
+  }
+
+  return availableModels as Model[];
 }
 
-export function toModelRow(params: {
-  model?: Model<Api>;
-  key: string;
-  tags: string[];
-  aliases?: string[];
-  availableKeys?: Set<string>;
-  cfg?: OpenClawConfig;
-  authStore?: AuthProfileStore;
-}): ModelRow {
-  const { model, key, tags, aliases = [], availableKeys, cfg, authStore } = params;
-  if (!model) {
-    return {
-      key,
-      name: key,
-      input: "-",
-      contextWindow: null,
-      local: null,
-      available: null,
-      tags: [...tags, "missing"],
-      missing: true,
-    };
+/** Loads the full registry, discovered keys, and model-level availability. */
+export async function loadModelRegistry(cfg: OpenClawConfig, opts?: ModelListRegistryOptions) {
+  const { authModes, config: runtimeConfig, registry } = await loadAgentModelRegistry(cfg, opts);
+  const isVisible = (model: Model) =>
+    !shouldSuppressBuiltInModelCore({
+      provider: model.provider,
+      id: model.id,
+      baseUrl: model.baseUrl,
+      config: runtimeConfig,
+    });
+  const models = registry.getAll().filter(isVisible);
+  const discoveredKeys = new Set(models.map((model) => modelKey(model.provider, model.id)));
+  let availableKeys: Set<string> | undefined;
+  let availabilityErrorMessage: string | undefined;
+  try {
+    const availableModels = validateAvailableModels(registry.getAvailable()).filter(isVisible);
+    availableKeys = new Set(availableModels.map((model) => modelKey(model.provider, model.id)));
+  } catch (err) {
+    // Availability failures use provider auth hints; an empty result remains authoritative.
+    // Registry discovery failures above still abort the command.
+    availabilityErrorMessage = `Model availability unavailable: getAvailable() failed.\n${formatErrorWithStack(err)}`;
   }
+  return { authModes, registry, models, discoveredKeys, availableKeys, availabilityErrorMessage };
+}
 
-  const input = model.input.join("+") || "text";
-  const local = isLocalBaseUrl(model.baseUrl);
-  const available =
-    cfg && authStore
-      ? hasAuthForProvider(model.provider, cfg, authStore)
-      : (availableKeys?.has(modelKey(model.provider, model.id)) ?? false);
-  const aliasTags = aliases.length > 0 ? [`alias:${aliases.join(",")}`] : [];
-  const mergedTags = new Set(tags);
-  if (aliasTags.length > 0) {
-    for (const tag of mergedTags) {
-      if (tag === "alias" || tag.startsWith("alias:")) {
-        mergedTags.delete(tag);
-      }
+/** Loads only configured registry entries and their auth availability. */
+export async function loadConfiguredListModelRegistry(
+  cfg: OpenClawConfig,
+  entries: ConfiguredEntry[],
+  opts?: Omit<ModelListRegistryOptions, "normalizeModels">,
+) {
+  // Configured-only rows use the credential-aware owner's targeted lookups.
+  const { config: runtimeConfig, registry } = await loadAgentModelRegistry(cfg, opts);
+  const discoveredKeys = new Set<string>();
+  const availableKeys = new Set<string>();
+  for (const entry of entries) {
+    const model = registry.find(entry.ref.provider, entry.ref.model);
+    if (
+      !model ||
+      shouldSuppressBuiltInModelCore({
+        provider: model.provider,
+        id: model.id,
+        baseUrl: model.baseUrl,
+        config: runtimeConfig,
+      })
+    ) {
+      continue;
     }
-    for (const tag of aliasTags) {
-      mergedTags.add(tag);
+    const key = modelKey(model.provider, model.id);
+    discoveredKeys.add(key);
+    if (registry.hasConfiguredAuth(model)) {
+      availableKeys.add(key);
     }
   }
-
-  return {
-    key,
-    name: model.name || model.id,
-    input,
-    contextWindow: model.contextWindow ?? null,
-    local,
-    available,
-    tags: Array.from(mergedTags),
-    missing: false,
-  };
+  return { registry, discoveredKeys, availableKeys };
 }

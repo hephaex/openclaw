@@ -5,14 +5,17 @@
  * Supports text and media (URL) sending with markdown stripping and chunking.
  */
 
-import { DEFAULT_ACCOUNT_ID, getAccountConfig } from "./config.js";
+import { createChannelMessageAdapterFromOutbound } from "openclaw/plugin-sdk/channel-outbound";
+import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { sanitizeAssistantVisibleText } from "openclaw/plugin-sdk/text-chunking";
+import { resolveTwitchAccountContext } from "./config.js";
+import { TWITCH_CHAT_MESSAGE_LIMIT } from "./constants.js";
 import { sendMessageTwitchInternal } from "./send.js";
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
   OutboundDeliveryResult,
 } from "./types.js";
-import { chunkTextForTwitch } from "./utils/markdown.js";
 import { missingTargetError, normalizeTwitchChannel } from "./utils/twitch.js";
 
 /**
@@ -25,11 +28,20 @@ export const twitchOutbound: ChannelOutboundAdapter = {
   /** Direct delivery mode - messages are sent immediately */
   deliveryMode: "direct",
 
-  /** Twitch chat message limit is 500 characters */
-  textChunkLimit: 500,
+  deliveryCapabilities: {
+    durableFinal: {
+      text: true,
+      media: true,
+      messageSendingHooks: true,
+    },
+  },
 
-  /** Word-boundary chunker with markdown stripping */
-  chunker: chunkTextForTwitch,
+  // The client manager chunks after the sender strips Markdown once.
+  // A core chunker would reparse literal Markdown and could erase visible text.
+  textChunkLimit: TWITCH_CHAT_MESSAGE_LIMIT,
+
+  /** Strip internal assistant tool-trace scaffolding before delivery */
+  sanitizeText: ({ text }) => sanitizeAssistantVisibleText(text),
 
   /**
    * Resolve target from context.
@@ -42,9 +54,7 @@ export const twitchOutbound: ChannelOutboundAdapter = {
    */
   resolveTarget: ({ to, allowFrom, mode }) => {
     const trimmed = to?.trim() ?? "";
-    const allowListRaw = (allowFrom ?? [])
-      .map((entry: unknown) => String(entry).trim())
-      .filter(Boolean);
+    const allowListRaw = normalizeStringEntries(allowFrom ?? []);
     const hasWildcard = allowListRaw.includes("*");
     const allowList = allowListRaw
       .filter((entry: string) => entry !== "*")
@@ -54,6 +64,12 @@ export const twitchOutbound: ChannelOutboundAdapter = {
     // If target is provided, normalize and validate it
     if (trimmed) {
       const normalizedTo = normalizeTwitchChannel(trimmed);
+      if (!normalizedTo) {
+        return {
+          ok: false,
+          error: missingTargetError("Twitch", "<channel-name>"),
+        };
+      }
 
       // For implicit/heartbeat modes with allowList, check against allowlist
       if (mode === "implicit" || mode === "heartbeat") {
@@ -63,28 +79,22 @@ export const twitchOutbound: ChannelOutboundAdapter = {
         if (allowList.includes(normalizedTo)) {
           return { ok: true, to: normalizedTo };
         }
-        // Fallback to first allowFrom entry
-        // biome-ignore lint/style/noNonNullAssertion: length > 0 check ensures element exists
-        return { ok: true, to: allowList[0] };
+        return {
+          ok: false,
+          error: missingTargetError("Twitch", "<channel-name>"),
+        };
       }
 
       // For explicit mode, accept any valid channel name
       return { ok: true, to: normalizedTo };
     }
 
-    // No target provided, use allowFrom fallback
-    if (allowList.length > 0) {
-      // biome-ignore lint/style/noNonNullAssertion: length > 0 check ensures element exists
-      return { ok: true, to: allowList[0] };
-    }
+    // No target provided - error
 
     // No target and no allowFrom - error
     return {
       ok: false,
-      error: missingTargetError(
-        "Twitch",
-        "<channel-name> or channels.twitch.accounts.<account>.allowFrom[0]",
-      ),
+      error: missingTargetError("Twitch", "<channel-name>"),
     };
   },
 
@@ -106,19 +116,19 @@ export const twitchOutbound: ChannelOutboundAdapter = {
    * });
    */
   sendText: async (params: ChannelOutboundContext): Promise<OutboundDeliveryResult> => {
-    const { cfg, to, text, accountId, signal } = params;
+    const { cfg, to, text, accountId } = params;
+    const signal = (params as { signal?: AbortSignal }).signal;
 
     if (signal?.aborted) {
       throw new Error("Outbound delivery aborted");
     }
 
-    const resolvedAccountId = accountId ?? DEFAULT_ACCOUNT_ID;
-    const account = getAccountConfig(cfg, resolvedAccountId);
+    const resolvedAccountId = accountId ?? resolveTwitchAccountContext(cfg).accountId;
+    const { account, availableAccountIds } = resolveTwitchAccountContext(cfg, resolvedAccountId);
     if (!account) {
-      const availableIds = Object.keys(cfg.channels?.twitch?.accounts ?? {});
       throw new Error(
         `Twitch account not found: ${resolvedAccountId}. ` +
-          `Available accounts: ${availableIds.join(", ") || "none"}`,
+          `Available accounts: ${availableAccountIds.join(", ") || "none"}`,
       );
     }
 
@@ -142,9 +152,10 @@ export const twitchOutbound: ChannelOutboundAdapter = {
 
     return {
       channel: "twitch",
+      ...(result.outcome ? { outcome: result.outcome } : {}),
       messageId: result.messageId,
+      receipt: result.receipt,
       timestamp: Date.now(),
-      to: normalizeTwitchChannel(channel),
     };
   },
 
@@ -167,7 +178,8 @@ export const twitchOutbound: ChannelOutboundAdapter = {
    * });
    */
   sendMedia: async (params: ChannelOutboundContext): Promise<OutboundDeliveryResult> => {
-    const { text, mediaUrl, signal } = params;
+    const { text, mediaUrl } = params;
+    const signal = (params as { signal?: AbortSignal }).signal;
 
     if (signal?.aborted) {
       throw new Error("Outbound delivery aborted");
@@ -184,3 +196,8 @@ export const twitchOutbound: ChannelOutboundAdapter = {
     });
   },
 };
+
+export const twitchMessageAdapter = createChannelMessageAdapterFromOutbound({
+  id: "twitch",
+  outbound: twitchOutbound,
+});

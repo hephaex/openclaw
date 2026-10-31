@@ -1,6 +1,5 @@
-import { ProxyAgent, fetch as undiciFetch } from "undici";
-import type { Dispatcher } from "undici";
-
+// Zalo plugin module implements proxy behavior.
+import { makeProxyFetch } from "openclaw/plugin-sdk/fetch-runtime";
 import type { ZaloFetch } from "./api.js";
 
 const proxyCache = new Map<string, ZaloFetch>();
@@ -14,9 +13,7 @@ export function resolveZaloProxyFetch(proxyUrl?: string | null): ZaloFetch | und
   if (cached) {
     return cached;
   }
-  const agent = new ProxyAgent(trimmed);
-  const fetcher: ZaloFetch = (input, init) =>
-    undiciFetch(input, { ...init, dispatcher: agent as Dispatcher });
+  const fetcher = makeProxyFetch(trimmed) as ZaloFetch;
   proxyCache.set(trimmed, fetcher);
   return fetcher;
 }

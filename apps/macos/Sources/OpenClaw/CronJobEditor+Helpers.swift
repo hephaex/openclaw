@@ -1,5 +1,5 @@
-import OpenClawProtocol
 import Foundation
+import OpenClawProtocol
 import SwiftUI
 
 extension CronJobEditor {
@@ -16,13 +16,22 @@ extension CronJobEditor {
         self.agentId = job.agentId ?? ""
         self.enabled = job.enabled
         self.deleteAfterRun = job.deleteAfterRun ?? false
-        self.sessionTarget = job.sessionTarget
+        switch job.parsedSessionTarget {
+        case let .predefined(target):
+            self.sessionTarget = target
+            self.preservedSessionTargetRaw = nil
+        case let .session(id):
+            self.sessionTarget = .isolated
+            self.preservedSessionTargetRaw = "session:\(id)"
+        }
         self.wakeMode = job.wakeMode
 
         switch job.schedule {
-        case let .at(atMs):
+        case let .at(at):
             self.scheduleKind = .at
-            self.atDate = Date(timeIntervalSince1970: TimeInterval(atMs) / 1000)
+            if let date = CronSchedule.parseAtDate(at) {
+                self.atDate = date
+            }
         case let .every(everyMs, _):
             self.scheduleKind = .every
             self.everyText = self.formatDuration(ms: everyMs)
@@ -30,25 +39,36 @@ extension CronJobEditor {
             self.scheduleKind = .cron
             self.cronExpr = expr
             self.cronTz = tz ?? ""
+        case .onExit:
+            // on-exit jobs are CLI-managed and have no editor form yet; fall back to
+            // the cron form so the editor still OPENS instead of failing to compile.
+            // Saving an on-exit job from the editor should be gated to avoid rewriting
+            // it as cron — tracked as a macOS read-only-editor follow-up.
+            self.scheduleKind = .cron
         }
 
         switch job.payload {
         case let .systemEvent(text):
             self.payloadKind = .systemEvent
             self.systemEventText = text
-        case let .agentTurn(message, thinking, timeoutSeconds, deliver, channel, to, bestEffortDeliver):
+        case let .agentTurn(message, thinking, timeoutSeconds, _, _, _, _):
             self.payloadKind = .agentTurn
             self.agentMessage = message
             self.thinking = thinking ?? ""
             self.timeoutSeconds = timeoutSeconds.map(String.init) ?? ""
-            self.deliver = deliver ?? false
-            let trimmed = (channel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            self.channel = trimmed.isEmpty ? "last" : trimmed
-            self.to = to ?? ""
-            self.bestEffortDeliver = bestEffortDeliver ?? false
+        case .command, .script:
+            break
         }
 
-        self.postPrefix = job.isolation?.postToMainPrefix ?? "Cron"
+        if let delivery = job.delivery {
+            self.deliveryMode = delivery.mode == .announce ? .announce : .none
+            let trimmed = (delivery.channel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            self.channel = trimmed.isEmpty ? "last" : trimmed
+            self.to = delivery.to ?? ""
+            self.bestEffortDeliver = delivery.bestEffort ?? false
+        } else if self.isIsolatedLikeSessionTarget {
+            self.deliveryMode = .announce
+        }
     }
 
     func save() {
@@ -62,6 +82,27 @@ extension CronJobEditor {
     }
 
     func buildPayload() throws -> [String: AnyCodable] {
+        if let job, !job.payload.isEditableInMacApp {
+            throw NSError(
+                domain: "Cron",
+                code: 0,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Command and script cron payloads are read-only in the macOS app; manage them with the CLI.",
+                ])
+        }
+        // Gate on-exit saves: the editor has no on-exit schedule form (it falls back to
+        // the cron form), so saving would rewrite the on-exit schedule as cron and
+        // corrupt the job. Block it until a read-only/native on-exit editor exists.
+        if let job, case .onExit = job.schedule {
+            throw NSError(
+                domain: "Cron",
+                code: 0,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "on-exit cron jobs can't be edited in the macOS app yet; manage them with the CLI.",
+                ])
+        }
         let name = try self.requireName()
         let description = self.trimmed(self.description)
         let agentId = self.trimmed(self.agentId)
@@ -75,7 +116,7 @@ extension CronJobEditor {
             "name": name,
             "enabled": self.enabled,
             "schedule": schedule,
-            "sessionTarget": self.sessionTarget.rawValue,
+            "sessionTarget": self.effectiveSessionTargetRaw,
             "wakeMode": self.wakeMode.rawValue,
             "payload": payload,
         ]
@@ -87,14 +128,35 @@ extension CronJobEditor {
             root["agentId"] = NSNull()
         }
 
-        if self.sessionTarget == .isolated {
-            let trimmed = self.postPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
-            root["isolation"] = [
-                "postToMainPrefix": trimmed.isEmpty ? "Cron" : trimmed,
-            ]
+        if self.isIsolatedLikeSessionTarget {
+            root["delivery"] = self.buildDelivery()
         }
 
         return root.mapValues { AnyCodable($0) }
+    }
+
+    func buildDelivery() -> [String: Any] {
+        let mode = self.deliveryMode == .announce ? "announce" : "none"
+        var delivery: [String: Any] = ["mode": mode]
+        if self.deliveryMode == .announce {
+            let trimmed = self.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+            delivery["channel"] = trimmed.isEmpty ? "last" : trimmed
+            let to = self.to.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !to.isEmpty { delivery["to"] = to }
+            if self.bestEffortDeliver {
+                delivery["bestEffort"] = true
+            } else if self.job?.delivery?.bestEffort == true {
+                delivery["bestEffort"] = false
+            }
+            if let destination = self.job?.delivery?.completionDestination {
+                delivery["completionDestination"] = destination.mapValues(\.value)
+            }
+        }
+        if let threadId = self.job?.delivery?.threadId { delivery["threadId"] = threadId.value }
+        if let destination = self.job?.delivery?.failureDestination {
+            delivery["failureDestination"] = destination.mapValues(\.value)
+        }
+        return delivery
     }
 
     func trimmed(_ value: String) -> String {
@@ -115,7 +177,7 @@ extension CronJobEditor {
     func buildSchedule() throws -> [String: Any] {
         switch self.scheduleKind {
         case .at:
-            return ["kind": "at", "atMs": Int(self.atDate.timeIntervalSince1970 * 1000)]
+            return ["kind": "at", "at": CronSchedule.formatIsoDate(self.atDate)]
         case .every:
             guard let ms = Self.parseDurationMs(self.everyText) else {
                 throw NSError(
@@ -141,7 +203,7 @@ extension CronJobEditor {
     }
 
     func buildSelectedPayload() throws -> [String: Any] {
-        if self.sessionTarget == .isolated { return self.buildAgentTurnPayload() }
+        if self.isIsolatedLikeSessionTarget { return self.buildAgentTurnPayload() }
         switch self.payloadKind {
         case .systemEvent:
             let text = self.trimmed(self.systemEventText)
@@ -152,7 +214,7 @@ extension CronJobEditor {
     }
 
     func validateSessionTarget(_ payload: [String: Any]) throws {
-        if self.sessionTarget == .main, payload["kind"] as? String == "agentTurn" {
+        if self.effectiveSessionTargetRaw == "main", payload["kind"] as? String == "agentTurn" {
             throw NSError(
                 domain: "Cron",
                 code: 0,
@@ -162,7 +224,7 @@ extension CronJobEditor {
                 ])
         }
 
-        if self.sessionTarget == .isolated, payload["kind"] as? String == "systemEvent" {
+        if self.effectiveSessionTargetRaw != "main", payload["kind"] as? String == "systemEvent" {
             throw NSError(
                 domain: "Cron",
                 code: 0,
@@ -209,14 +271,6 @@ extension CronJobEditor {
         let thinking = self.thinking.trimmingCharacters(in: .whitespacesAndNewlines)
         if !thinking.isEmpty { payload["thinking"] = thinking }
         if let n = Int(self.timeoutSeconds), n > 0 { payload["timeoutSeconds"] = n }
-        payload["deliver"] = self.deliver
-        if self.deliver {
-            let trimmed = self.channel.trimmingCharacters(in: .whitespacesAndNewlines)
-            payload["channel"] = trimmed.isEmpty ? "last" : trimmed
-            let to = self.to.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !to.isEmpty { payload["to"] = to }
-            payload["bestEffortDeliver"] = self.bestEffortDeliver
-        }
         return payload
     }
 
@@ -246,15 +300,21 @@ extension CronJobEditor {
         return Int(floor(n * factor))
     }
 
+    var effectiveSessionTargetRaw: String {
+        if self.sessionTarget == .isolated,
+           let preserved = self.preservedSessionTargetRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !preserved.isEmpty
+        {
+            return preserved
+        }
+        return self.sessionTarget.rawValue
+    }
+
+    var isIsolatedLikeSessionTarget: Bool {
+        self.effectiveSessionTargetRaw != "main"
+    }
+
     func formatDuration(ms: Int) -> String {
-        if ms < 1000 { return "\(ms)ms" }
-        let s = Double(ms) / 1000.0
-        if s < 60 { return "\(Int(round(s)))s" }
-        let m = s / 60.0
-        if m < 60 { return "\(Int(round(m)))m" }
-        let h = m / 60.0
-        if h < 48 { return "\(Int(round(h)))h" }
-        let d = h / 24.0
-        return "\(Int(round(d)))d"
+        DurationFormattingSupport.conciseDuration(ms: ms)
     }
 }
