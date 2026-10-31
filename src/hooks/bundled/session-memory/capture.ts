@@ -76,7 +76,11 @@ function captureRecentSessionMemoryEvents(
 // Memory excerpts span compactions, but never reach across the latest reset.
 // Reset history replays only user/assistant rows; discard kept-prefix tools
 // before applying capture budgets, just like the projection reader.
-function selectCurrentMemoryWindow(events: TranscriptEvent[]): TranscriptEvent[] {
+// Exported for reuse by the sibling openclaw-memory-write hook, which needs
+// the same compaction/reset-boundary-aware window selection but over raw
+// (not summary-rendered) transcript events. This is a visibility change
+// only -- session-memory's own behavior is unchanged.
+export function selectCurrentMemoryWindow(events: TranscriptEvent[]): TranscriptEvent[] {
   const active = selectVisibleTranscriptEvents(events);
   const boundaryIndex = active.findLastIndex((event) => isRecord(event) && event.type === "reset");
   const boundary = active[boundaryIndex];
